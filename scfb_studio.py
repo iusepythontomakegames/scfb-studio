@@ -356,12 +356,27 @@ class Parser:
 
         m = re.match(r"^input\s*(.*)$", s)
         if m:
+            cond = m.group(1).strip().rstrip("{").strip()
             idx = len(prog)
-            prog.append({"op": "input",
-                         "cond": m.group(1).strip().rstrip("{").strip(),
-                         "line": ln, "end": None})
-            i = self._parse_into(i, "fi")
-            prog[idx]["end"] = len(prog)
+            prog.append({"op": "input", "cond": cond, "line": ln, "end": None})
+            if s.rstrip().endswith("{"):
+                # explicit block:  input EXPECTED { ... fi
+                i = self._parse_into(i, "fi")
+                prog[idx]["end"] = len(prog)
+            else:
+                # no '{' — look ahead: an immediate 'fi' means an empty
+                # block; anything else means a plain read (no fi needed)
+                j = i
+                nxt = ""
+                while j < len(self.lines):
+                    nxt = strip_comment(self.lines[j]).strip()
+                    if nxt:
+                        break
+                    j += 1
+                if nxt in ("fi", "}"):
+                    j += 1  # consume it
+                prog[idx]["end"] = len(prog)
+                i = j
             return i
 
         m = re.match(r"^jump\s+\.?([A-Za-z_]\w*)\s*$", s)
@@ -517,9 +532,10 @@ class Runtime:
     """Executes a flat SCFB basic program. Thread-friendly: all UI contact
     goes through the provided callbacks (put things on queues there)."""
 
-    def __init__(self, source, out, redraw, input_queue, workdir="."):
+    def __init__(self, source, out, redraw, input_queue, workdir=".", notify=None):
         self.out = out              # out(text, tone) tone: 'out'|'err'|'sys'
         self.redraw = redraw
+        self.notify = notify or (lambda kind: None)
         self.input_queue = input_queue
         self.workdir = workdir
         self.program = Parser(source.splitlines()).parse()
@@ -620,6 +636,8 @@ class Runtime:
         return DEFAULT_RGB
 
     def _read_input(self):
+        self.out("…waiting for input — type below and press Enter", "in")
+        self.notify("needinput")
         while True:
             if self.stop:
                 raise StopRun()
@@ -720,16 +738,23 @@ class Runtime:
                 return None
             return st["end"]
         if op == "input":
-            self.out("waiting for input…", "sys")
             line = self._read_input()
             self.out("> " + line, "in")
-            if self.selected is not None:
-                self.vars[self.selected] = line
-            if st["cond"]:
-                expected = fmt_value(self.eval(st["cond"]))
-                if line.strip() != expected:
-                    return st["end"]
-            return None
+            if not st["cond"]:
+                # bare input: read a value into the selected variable
+                if self.selected is not None:
+                    self.vars[self.selected] = line
+                else:
+                    self.out("(no variable selected — input discarded)", "sys")
+                return None
+            expected = self._input_expected(st["cond"])
+            matched = line.strip().lower() == fmt_value(expected).strip().lower()
+            if st["end"] == pc + 1:
+                # no block — just report the outcome in the LOG
+                self.out("input %s %r" % ("matched" if matched else "did not match",
+                                          fmt_value(expected)), "sys")
+                return None
+            return None if matched else st["end"]
         if op == "funcdef":
             return st["end"]
         if op == "call":
@@ -754,6 +779,17 @@ class Runtime:
             self.redraw()
             return None
         raise ScfbError("internal: bad op %r" % op)
+
+    def _input_expected(self, cond):
+        """input placeholders are literal text: a bare word (input yes) or a
+        quoted string (input "yes") compare as text; anything else
+        (input var 1, input 5 + 2) is evaluated as an expression."""
+        c = cond.strip()
+        if c.startswith('"') and c.endswith('"') and len(c) >= 2 and '"' not in c[1:-1]:
+            return c[1:-1]
+        if re.fullmatch(r"[A-Za-z_]\w*", c):
+            return c
+        return self.eval(c)
 
     def _do_import(self, st):
         path = os.path.join(self.workdir, st["path"])
@@ -1100,8 +1136,12 @@ STATEMENTS
                             print(mybox.width), print(file.something), ...
   ref NAME                  reference something (rot targets the ref)
   if COND { ... fi          branch — skips to fi when false
-  input EXPECTED { ... fi   wait for input (bar under the screen); run the
-                            block when it matches EXPECTED (bare input reads)
+  input WORD { ... fi      wait for input (bar under the screen); run the
+                            block when the typed line matches WORD — quotes
+                            optional (input yes == input "yes"), match is
+                            case-insensitive. No block: input WORD just waits
+                            and reports the match in the LOG. Bare input
+                            (no WORD) reads a line into the selected var.
   function NAME() { ... fi  define a function — call with  call NAME()
   jump .CHECKPOINT          jump to a checkpoint (jump loops = animation)
   .name                     a checkpoint
@@ -1422,7 +1462,9 @@ def launch_ui():
 
     inbar = tk.Frame(screen_f, bg=C["card2"])
     inbar.pack(fill="x", padx=8, pady=(0, 6))
-    tk.Label(inbar, text="input ❯", bg=C["card2"], fg=C["accent"], font=F_MONO_S).pack(side="left", padx=(8, 4), pady=4)
+    in_lbl = tk.Label(inbar, text="input ❯", bg=C["card2"], fg=C["accent"],
+                     font=F_MONO_S)
+    in_lbl.pack(side="left", padx=(8, 4), pady=4)
     entry = tk.Entry(inbar, bg=C["card2"], fg=C["text"], insertbackground=C["text"],
                      bd=0, font=F_MONO_S, relief="flat")
     entry.pack(side="left", fill="x", expand=True, pady=4)
@@ -1579,7 +1621,8 @@ def launch_ui():
                         out=lambda t, tone: out_q.put((t, tone)),
                         redraw=lambda: evt_q.put(("redraw",)),
                         input_queue=in_q,
-                        workdir=st.workdir)
+                        workdir=st.workdir,
+                        notify=lambda kind: evt_q.put((kind,)))
         set_running(True, "Running…")
         threading.Thread(target=worker, daemon=True).start()
         render()
@@ -1593,6 +1636,8 @@ def launch_ui():
         txt = entry.get().strip()
         entry.delete(0, "end")
         if st.running:
+            st.waiting = False
+            in_lbl.config(fg=C["accent"], text="input ❯")
             in_q.put(txt)
         else:
             log_put("(runtime not running — input ignored)", "sys")
@@ -1676,10 +1721,17 @@ def launch_ui():
                 elif ev[0] == "state":
                     set_running(False, ev[1])
                     dirty = True
+                elif ev[0] == "needinput":
+                    st.waiting = True
+                    in_lbl.config(fg="#ff9a3c", text="input ❯ (waiting…)")
+                    entry.focus_set()
         except queue.Empty:
             pass
         if st.running and st.rt:
-            status_var.set("Running…  {:,} steps".format(st.rt.steps))
+            if getattr(st, "waiting", False):
+                status_var.set("Waiting for input — type below, press Enter")
+            else:
+                status_var.set("Running…  {:,} steps".format(st.rt.steps))
         if dirty:
             render()
         root.after(80, poll)
@@ -1796,7 +1848,7 @@ def selftest():
     else:
         os.environ["LOCALAPPDATA"] = old_home
 
-    # 2 — input branch
+    # 2 — input: quoted placeholder + block
     inq = queue.Queue()
     inq.put("yes")
     outs2 = []
@@ -1805,8 +1857,41 @@ def selftest():
                   redraw=lambda: None, input_queue=inq)
     rt2.run()
     texts2 = [t for t, tone in outs2 if tone == "out"]
-    check("input match runs block", "matched" in texts2, str(texts2))
-    check("input stored to var", "yes" in texts2, str(texts2))
+    check("input match runs block", "matched" in texts2 and "after" not in texts2, str(texts2))
+    check("placeholder input leaves vars alone", "0" in texts2, str(texts2))
+
+    # 2b — bare input reads into the selected variable
+    inq2 = queue.Queue()
+    inq2.put("hello")
+    outs2b = []
+    rt2b = Runtime('cvar 7\nvar 7\ninput\nprint(var 7)',
+                   out=lambda t, tone: outs2b.append((t, tone)),
+                   redraw=lambda: None, input_queue=inq2)
+    rt2b.run()
+    texts2b = [t for t, tone in outs2b if tone == "out"]
+    check("bare input stores to selected var", "hello" in texts2b, str(texts2b))
+
+    # 2c — bare word placeholder, case-insensitive, no quotes
+    inq2c = queue.Queue()
+    inq2c.put("YES")
+    outs2c = []
+    rt2c = Runtime('input yes {\n    print("yep")\nfi',
+                   out=lambda t, tone: outs2c.append((t, tone)),
+                   redraw=lambda: None, input_queue=inq2c)
+    rt2c.run()
+    texts2c = [t for t, tone in outs2c if tone == "out"]
+    check("bare-word input matches (case-insensitive)", "yep" in texts2c, str(texts2c))
+
+    # 2d — input without a block and without fi
+    inq2d = queue.Queue()
+    inq2d.put("x")
+    outs2d = []
+    rt2d = Runtime('input "x"\nprint("continues")',
+                   out=lambda t, tone: outs2d.append((t, tone)),
+                   redraw=lambda: None, input_queue=inq2d)
+    s2d = rt2d.run()
+    texts2d = [t for t, tone in outs2d if tone == "out"]
+    check("input works with no block/fi", s2d == "ok" and "continues" in texts2d, str(texts2d))
 
     # 3 — mismatched input skips block
     inq2 = queue.Queue()
