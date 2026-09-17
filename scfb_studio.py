@@ -5,6 +5,8 @@ SCFB Studio — a runtime + Windows 11 UI for the "SCFB basic" DSL.
 
 Run (Windows 11):   py scfb_studio.py
 Headless test:      py scfb_studio.py --selftest
+Package manager:    py scfb_studio.py spm install all
+                    (see: py scfb_studio.py spm help)
 
 Stdlib only (tkinter UI). Windows-11 focused: per-monitor DPI awareness,
 immersive dark title bar + Mica attempt, Segoe UI Variable / Cascadia Code,
@@ -49,6 +51,10 @@ class ScfbError(Exception):
 
 class StopRun(Exception):
     pass
+
+
+class _ProgramEnd(Exception):
+    """Raised internally when the main program reaches its end."""
 
 
 # ═══════════════════════════ expression engine ══════════════════════════
@@ -223,6 +229,11 @@ class _ExprParser:
             if not _isnum(v):
                 raise ScfbError("unary '-' needs a number")
             return -v
+        if self.eat_op(("(",)):
+            v = self.p_or()
+            if not self.eat_op((")",)):
+                raise ScfbError("expected ')' in expression")
+            return v
         return self.p_primary()
 
     def p_primary(self):
@@ -232,6 +243,22 @@ class _ExprParser:
         if k == "varref":
             return self.rt.get_var(v)
         if k == "ident":
+            k2, v2 = self.peek()
+            if k2 == "op" and v2 == "(":
+                # extension function call, e.g. print(rnd(1, 100))
+                if not self.rt.has_ext_func(v):
+                    raise ScfbError("unknown function: %s()" % v)
+                self.i += 1
+                args = []
+                if self.peek() != ("op", ")"):
+                    while True:
+                        args.append(self.p_or())
+                        if not self.eat_op((",",)):
+                            break
+                if self.peek() != ("op", ")"):
+                    raise ScfbError("missing ')' in %s(...)" % v)
+                self.i += 1
+                return self.rt.call_ext_func(v, args)
             val = self.rt.value_of(v)
             name = v
             while True:
@@ -267,7 +294,7 @@ _TYPE_ATTR = re.compile(r'type\s*=\s*"([^"]+)"')
 _DEF_TYPE = re.compile(r'^def\s+\w+\s+type\s*=\s*"(\w+)"\s*$')
 
 _KEYWORDS = ("if", "input", "function", "print", "draw", "rot", "var", "cvar",
-             "def", "create", "ref", "jump", "import", "call")
+             "def", "create", "ref", "jump", "import", "call", "lib", "ext")
 
 
 class Parser:
@@ -345,6 +372,16 @@ class Parser:
         m = re.match(r"^import\s+<([^>]+)>\s*$", s)
         if m:
             prog.append({"op": "import", "path": m.group(1), "line": ln})
+            return i
+
+        m = re.match(r"^lib\s+<?([^>]+?)>?\s*$", s)
+        if m:
+            prog.append({"op": "lib", "name": m.group(1), "line": ln})
+            return i
+
+        m = re.match(r"^ext\s+<?([^>]+?)>?\s*$", s)
+        if m:
+            prog.append({"op": "ext", "name": m.group(1), "line": ln})
             return i
 
         m = re.match(r"^print\s*\((.*)\)\s*$", s)
@@ -502,6 +539,7 @@ class Runtime:
         self.ref_target = None
         self.stop = False
         self.steps = 0
+        self.ext_funcs = {}
 
     # ---- helpers ----------------------------------------------------------
     def eval(self, expr):
@@ -593,20 +631,29 @@ class Runtime:
     # ---- main loop --------------------------------------------------------
     def run(self):
         prog = self.program
+        # fall-through guard: without this, execution walks off the end of
+        # the user's program straight into lib/import-appended statements
+        prog.append({"op": "end", "line": len(prog) + 1})
         pc = 0
         self._frames = []  # (end_index, return_pc) for active calls
         frames = self._frames
         status = "ok"
         try:
-            while pc < len(prog):
+            while True:
+                # return from function/lib frames BEFORE checking the end —
+                # a lib loaded last lands exactly at len(prog)
                 if frames and pc == frames[-1][0]:
                     pc = frames.pop()[1]
                     continue
+                if pc >= len(prog):
+                    break
                 self.steps += 1
                 if self.stop:
                     raise StopRun()
                 nxt = self._exec(prog[pc], pc)
                 pc = pc + 1 if nxt is None else nxt
+            self.out("— program finished —", "sys")
+        except _ProgramEnd:
             self.out("— program finished —", "sys")
         except StopRun:
             self.out("— stopped —", "sys")
@@ -619,6 +666,8 @@ class Runtime:
     # ---- statement exec ---------------------------------------------------
     def _exec(self, st, pc):
         op = st["op"]
+        if op == "end":
+            raise _ProgramEnd()
         if op == "checkpoint":
             return None
         if op == "def":
@@ -649,6 +698,11 @@ class Runtime:
             return None
         if op == "import":
             self._do_import(st)
+            return None
+        if op == "lib":
+            return self._do_lib(st, pc)
+        if op == "ext":
+            self._do_ext(st)
             return None
         if op == "create":
             name, typ = st["name"], st["type"]
@@ -763,6 +817,102 @@ class Runtime:
         rz = self.eval(body.get("z", "0"))
         obj["rot"] = [float(rx), float(ry), float(rz)]
         self.redraw()
+
+    # ---- packages: lib / ext -------------------------------------------
+    def _find_pkg(self, name, folder, suffix):
+        home = scfb_home()
+        for cand in (os.path.join(home, folder, name + suffix),
+                     os.path.join(folder, name + suffix)):
+            if os.path.isfile(cand):
+                return cand
+        return None
+
+    def _do_lib(self, st, pc):
+        name = st["name"]
+        path = self._find_pkg(name, "libs", ".scb")
+        if path is None:
+            raise ScfbError("library %r is not installed — run: "
+                           "py scfb_studio.py spm install %s" % (name, name), st["line"])
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        sub = Parser(content.splitlines()).parse()
+        off = len(self.program)
+        for s2 in sub:  # rebase local branch/function ranges (same as import)
+            if "end" in s2:
+                s2["end"] += off
+            if s2["op"] == "funcdef":
+                s2["start"] += off
+        self.program.extend(sub)
+        nf = 0
+        for idx, s2 in enumerate(sub):
+            if s2["op"] == "checkpoint":
+                self.checkpoints[s2["name"]] = off + idx
+            elif s2["op"] == "funcdef":
+                self.funcs[s2["name"]] = (s2["start"], s2["end"])
+                nf += 1
+        # run the library's top level up to its FIRST checkpoint
+        # (statements after a checkpoint — like animation loops — are
+        # only reachable via jump, so loading never runs an infinite loop)
+        first_cp = next((idx for idx, s2 in enumerate(sub)
+                         if s2["op"] == "checkpoint"), len(sub))
+        self.out("lib <%s> loaded — %d statement(s), %d function(s)" % (name, len(sub), nf), "sys")
+        self._frames.append((off + first_cp, pc + 1))
+        return off
+
+    def _do_ext(self, st):
+        name = st["name"]
+        path = self._find_pkg(name, "ext", ".py")
+        if path is None:
+            raise ScfbError("extension %r is not installed — run: "
+                           "py scfb_studio.py spm install %s" % (name, name), st["line"])
+        import importlib.util
+        modname = "scfb_ext_" + re.sub(r"\W", "_", name)
+        spec = importlib.util.spec_from_file_location(modname, path)
+        mod = importlib.util.module_from_spec(spec)
+        before = len(self.ext_funcs)
+        try:
+            spec.loader.exec_module(mod)
+            mod.on_load(self)
+        except Exception as e:
+            raise ScfbError("extension <%s> failed to load: %s" % (name, e), st["line"])
+        self.out("ext <%s> loaded — %d new function(s)" % (name, len(self.ext_funcs) - before), "sys")
+        return None
+
+    # ---- extension API ---------------------------------------------------
+    def register_ext_func(self, name, fn):
+        self.ext_funcs[name] = fn
+
+    def has_ext_func(self, name):
+        return name in self.ext_funcs
+
+    def call_ext_func(self, name, args):
+        try:
+            return self.ext_funcs[name](*args)
+        except ScfbError:
+            raise
+        except Exception as e:
+            raise ScfbError("%s() failed: %s" % (name, e))
+
+    def obj(self, name):
+        return self.objects_by_name.get(str(name))
+
+    def add_box(self, w=100, h=100, x=None, y=None, rgb=None):
+        obj = {"type": "box", "w": float(w), "h": float(h), "d": None,
+               "rot": [0.0, 0.0, 0.0],
+               "rgb": tuple(rgb) if rgb else DEFAULT_RGB,
+               "name": None,
+               "px": float(x) if x is not None else None,
+               "py": float(y) if y is not None else None}
+        self.objects.append(obj)
+        self.redraw()
+        return obj
+
+    def add_object(self, w=100, h=100, d=100, x=None, y=None, rgb=None):
+        obj = self.add_box(w, h, x, y, rgb)
+        obj["type"] = "object"
+        obj["d"] = float(d)
+        self.redraw()
+        return obj
 
 
 # ═══════════════════════════════ renderer ═══════════════════════════════
@@ -893,6 +1043,12 @@ create cube {
     def cube type="object"
 }
 
+// libraries & extensions — install from your terminal first:
+//   py scfb_studio.py spm install math mathx
+// lib <math>
+// ext <mathx>
+// print(rnd(1, 100))
+
 // rotate the cube — it updates in place on the screen
 ref cube
 rot type="object" {
@@ -934,6 +1090,11 @@ STATEMENTS
   var N = EXPR              select and set variable N
   import <file.scb>         load a file — its functions & checkpoints are
                             registered; print(name.something) prints contents
+  lib <name>                load an INSTALLED library (spm install name) —
+                            runs its top-level defs/vars and registers its
+                            functions & checkpoints for call name()
+  ext <name>                load an INSTALLED extension — adds functions
+                            callable in expressions: print(rnd(1, 100))
   print("text")             print literal text onto the SCREEN
   print(EXPR)               print evaluated things: print(5 + 2) → 7
                             print(mybox.width), print(file.something), ...
@@ -976,8 +1137,167 @@ RUNTIME NOTES
   · A box with no rotation renders as a pixel-exact square/rectangle.
   · input is typed in the bar under the screen; the typed line shows there.
   · Colors: without an rgb line, variables 1, 2, 3 are used as RGB.
+
+PACKAGES (spm — the SCFB package manager, from your terminal)
+  py scfb_studio.py spm available          list registry packages
+  py scfb_studio.py spm install math       install a library (lib <math>)
+  py scfb_studio.py spm install mathx      install an extension (ext <mathx>)
+  py scfb_studio.py spm install all        install everything
+  py scfb_studio.py spm update all         refresh everything
+  py scfb_studio.py spm remove NAME        uninstall
+  py scfb_studio.py spm list               show installed
+  Libraries are SCFB basic files; extensions are Python plugins that add
+  functions callable inside expressions (e.g. print(rnd(1, 100))).
+  Conventions: math/calc → var 1,2 in, var 9 out; color → vars 1-3 RGB;
+  shapes → var 4 size, var 5/6 x,y.
 """
 
+
+
+# ══════════════════════════ spm package manager ═════════════════════════
+
+def scfb_home():
+    """Where installed libraries/extensions live (%LOCALAPPDATA%\scfb)."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "scfb")
+
+
+REGISTRY_RAW = "https://raw.githubusercontent.com/iusepythontomakegames/scfb-registry/main"
+
+
+def _reg_read(base, rel):
+    if os.path.isdir(base):
+        with open(os.path.join(base, rel), "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    import urllib.request
+    with urllib.request.urlopen(base + "/" + rel, timeout=20) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def spm_main(argv):
+    """spm — the SCFB package manager (run from PowerShell / Command Prompt)
+
+    py scfb_studio.py spm available              list registry packages
+    py scfb_studio.py spm search TERM            filter by name/description
+    py scfb_studio.py spm install math mathx     install packages
+    py scfb_studio.py spm install all            install EVERYTHING
+    py scfb_studio.py spm update all             refresh installed packages
+    py scfb_studio.py spm remove math            uninstall
+    py scfb_studio.py spm list                   show installed packages
+    py scfb_studio.py spm home                    print the install directory
+    (--registry URL-or-dir overrides the package source)"""
+    import json
+    reg_base = REGISTRY_RAW
+    args = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--registry" and i + 1 < len(argv):
+            reg_base = argv[i + 1]
+            i += 2
+            continue
+        args.append(argv[i])
+        i += 1
+    cmd = args[0].lower() if args else "help"
+    rest = args[1:]
+    home = scfb_home()
+    libs_dir = os.path.join(home, "libs")
+    ext_dir = os.path.join(home, "ext")
+
+    def registry():
+        try:
+            return json.loads(_reg_read(reg_base, "registry.json")).get("packages", [])
+        except Exception as e:
+            print("spm: cannot read the registry: %s" % e)
+            return None
+
+    if cmd == "home":
+        print(home)
+        return 0
+    if cmd == "help":
+        print(spm_main.__doc__)
+        return 0
+
+    if cmd == "list":
+        print("installed in %s" % home)
+        found = False
+        for folder, kind, ext in ((libs_dir, "lib", ".scb"), (ext_dir, "ext", ".py")):
+            if os.path.isdir(folder):
+                for fn in sorted(os.listdir(folder)):
+                    if fn.endswith(ext):
+                        print("  %-4s %s" % (kind, fn[:-len(ext)]))
+                        found = True
+        if not found:
+            print("  (nothing installed — try: spm install all)")
+        return 0
+
+    if cmd in ("available", "search"):
+        packages = registry()
+        if packages is None:
+            return 1
+        term = rest[0].lower() if rest else ""
+        shown = 0
+        for p in packages:
+            hay = (p.get("name", "") + " " + p.get("desc", "")).lower()
+            if cmd == "available" or term in hay:
+                print("  %-8s %-3s v%-4s %s" % (p["name"], p.get("kind", "?"),
+                                                p.get("version", "?"), p.get("desc", "")))
+                shown += 1
+        print("%d package(s) in the registry" % shown)
+        return 0
+
+    if cmd in ("install", "update"):
+        packages = registry()
+        if packages is None:
+            return 1
+        names = []
+        for a in rest:
+            if a.lower() == "all":
+                names.extend(p["name"] for p in packages)
+            else:
+                names.append(a)
+        if not names:
+            print("spm: %s needs a package name (or 'all')" % cmd)
+            return 1
+        ok = 0
+        for name in names:
+            pkg = next((p for p in packages if p["name"] == name), None)
+            if pkg is None:
+                print("spm: no package named %r (see: spm available)" % name)
+                continue
+            try:
+                content = _reg_read(reg_base, pkg["file"])
+            except Exception as e:
+                print("spm: failed to download %s: %s" % (pkg["file"], e))
+                continue
+            dest_dir = libs_dir if pkg.get("kind") == "lib" else ext_dir
+            dest = os.path.join(dest_dir, os.path.basename(pkg["file"]))
+            os.makedirs(dest_dir, exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(content)
+            print("spm: %sd %s v%s -> %s" % (cmd, pkg["name"], pkg.get("version", "?"), dest))
+            ok += 1
+        print("spm: done (%d/%d)" % (ok, len(names)))
+        return 0 if ok else 1
+
+    if cmd == "remove":
+        if not rest:
+            print("spm: remove needs a package name")
+            return 1
+        ok = 0
+        for name in rest:
+            for folder, ext in ((libs_dir, ".scb"), (ext_dir, ".py")):
+                p = os.path.join(folder, name + ext)
+                if os.path.isfile(p):
+                    os.remove(p)
+                    print("spm: removed %s" % name)
+                    ok += 1
+        if not ok:
+            print("spm: %r is not installed" % rest[0])
+            return 1
+        return 0
+
+    print("spm: unknown command %r — try: spm help" % cmd)
+    return 1
 
 # ═══════════════════════════════ UI (tkinter) ════════════════════════════
 
@@ -1426,6 +1746,56 @@ def selftest():
           len(stub.polys) == 6 and all(_convex(p) for p in stub.polys),
           "%d polys" % len(stub.polys))
 
+    # 1c — libraries and extensions (fake install dir as LOCALAPPDATA)
+    import tempfile as _temp
+    import json as _json
+    tmp = _temp.mkdtemp(prefix="scfb_home_")
+    old_home = os.environ.get("LOCALAPPDATA")
+    os.environ["LOCALAPPDATA"] = tmp
+    os.makedirs(os.path.join(tmp, "scfb", "libs"))
+    os.makedirs(os.path.join(tmp, "scfb", "ext"))
+    with open(os.path.join(tmp, "scfb", "libs", "tlib.scb"), "w") as f:
+        f.write('def tl_pi 3\n\nfunction tl_hi() {\n    var 8 = 41\n    var 8 = var 8 + 1\n    print("lib fn says " + var 8)\nfi\n')
+    with open(os.path.join(tmp, "scfb", "ext", "tx.py"), "w") as f:
+        f.write("def on_load(rt):\n    rt.register_ext_func('tx_add', lambda a, b: a + b)\n")
+
+    o1 = []
+    rtl = Runtime('lib <tlib>\ncall tl_hi()\nprint(tl_pi)\nprint((5 + 2) * 2)',
+                  out=lambda t, tone: o1.append((t, tone)),
+                  redraw=lambda: None, input_queue=queue.Queue())
+    sl = rtl.run()
+    tl = [t for t, tone in o1 if tone == "out"]
+    check("lib loads & runs top-level defs", sl == "ok" and "3" in tl, str(tl))
+    check("lib function callable", "lib fn says 42" in tl, str(tl))
+    check("parenthesized expressions", "14" in tl, str(tl))
+
+    o2 = []
+    rte = Runtime('ext <tx>\nprint(tx_add(2, 3))',
+                  out=lambda t, tone: o2.append((t, tone)),
+                  redraw=lambda: None, input_queue=queue.Queue())
+    se = rte.run()
+    te = [t for t, tone in o2 if tone == "out"]
+    check("extension registers functions", se == "ok" and "5" in te, str(te))
+
+    # 1d — spm against a local registry
+    reg = _temp.mkdtemp(prefix="scfb_reg_")
+    os.makedirs(os.path.join(reg, "libs"))
+    with open(os.path.join(reg, "registry.json"), "w") as f:
+        _json.dump({"packages": [{"name": "spmtest", "kind": "lib", "version": "1.0",
+                                   "file": "libs/spmtest.scb", "desc": "test lib"}]}, f)
+    with open(os.path.join(reg, "libs", "spmtest.scb"), "w") as f:
+        f.write('function spmtest_hi() {\n    print("spm ok")\nfi\n')
+    rc = spm_main(["install", "spmtest", "--registry", reg])
+    installed = os.path.isfile(os.path.join(tmp, "scfb", "libs", "spmtest.scb"))
+    check("spm installs from registry", rc == 0 and installed)
+    rc2 = spm_main(["remove", "spmtest"])
+    check("spm removes packages",
+          rc2 == 0 and not os.path.isfile(os.path.join(tmp, "scfb", "libs", "spmtest.scb")))
+    if old_home is None:
+        os.environ.pop("LOCALAPPDATA", None)
+    else:
+        os.environ["LOCALAPPDATA"] = old_home
+
     # 2 — input branch
     inq = queue.Queue()
     inq.put("yes")
@@ -1512,4 +1882,6 @@ def selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    if len(sys.argv) > 1 and sys.argv[1] == "spm":
+        sys.exit(spm_main(sys.argv[2:]))
     launch_ui()
