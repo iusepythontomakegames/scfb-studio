@@ -10,79 +10,38 @@ Headless self-test:
 
     py scfb_studio.py --selftest
 
-## v1.1 — one live SCREEN, real runtime behavior
+## v1.2 — packages: spm + lib + ext
 
-- **SCREEN**: `print` text and drawn objects share ONE live canvas — text renders like a terminal, boxes/objects draw at real pixel positions (`x,y;` in draw blocks, optional). It's a runtime, not a museum.
-- **LOG**: runtime chatter (start/stop/import/errors) is kept separate in its own pane.
-- **No more sad triangles**: the 3D cube face corners were not in ring order (every face drew as a self-crossing bowtie = 2 triangles). Faces are now proper rings — a real shaded cube.
-- 2D boxes render as pixel-exact squares/rectangles (rotated polygon only when you actually `rot` them).
-- `rot` updates objects **in place** at their position.
-- No step limit — `jump` loops animate forever until you press Stop; the status bar shows a live step counter.
-- Fixed: `import`ed files had un-rebased branch indices (could loop); now their functions/checkpoints/branches work correctly.
+- **spm — the SCFB package manager** (from PowerShell / Command Prompt):
+
+      py scfb_studio.py spm available        list registry packages
+      py scfb_studio.py spm install all      install every library + extension
+      py scfb_studio.py spm install math     install one (or several)
+      py scfb_studio.py spm update all       refresh
+      py scfb_studio.py spm remove NAME      uninstall
+      py scfb_studio.py spm list             show installed
+
+  Packages come from the `scfb-registry` repo and install to `%LOCALAPPDATA%\scfb`.
+
+- **`lib <math>`** — load an installed SCFB basic library: its top-level defs/vars run
+  on load (up to its first checkpoint), its functions are called with `call name()`.
+- **`ext <mathx>`** — load an installed Python extension: registers functions callable
+  inside expressions, e.g. `print(rnd(1, 100))`, `var 8 = spinby("cube", 2, 1, 0)`.
+- Parenthesized expressions now work: `print((5 + 2) * 2)`.
+- Fixed: programs could fall through their end into lib/import-appended code
+  (e.g. anim's infinite spin loop) — a guard statement now ends programs cleanly.
+
+Libraries: math, color, shapes, calc, std, greet, demo, anim (.spin3d/.spin2d animation loops).
+Extensions: mathx, timex, winx (beep/msgbox/speak/clip), filex, sysx, canvasx, textx, netx.
 
 ## Features
 
-- Dark Windows 11 title bar (Mica attempt), Segoe UI Variable / Cascadia Code, per-monitor DPI awareness
-- Code editor with line numbers, Run (F5 / Ctrl+Enter), Stop, Open, Save, Example, Help
-- Full language: `def`, `create` (top-to-bottom naming, one-use per entity), `cvar`/`var`,
-  `import <file.scb>`, both `print` forms, `ref`, `if` + `fi`, `input` + `fi`,
-  `function NAME()` + `call`, `jump`, `.checkpoints`, `draw`/`rot` (with optional `x,y` positions),
-  operators `== = + - * / > < >= <= && ||`, `//` comments
-- Colors from variables: `rgb; var 1, var 2, var 3` (or variables 1-3 as RGB by default)
-- Input bar under the screen; typed lines show on the screen
-- Help window inside the app with the full language reference; a demo program is preloaded
-
-## Example
-
-    .start
-    cvar 1
-    cvar 2
-    cvar 3
-    var 1 = 100
-    var 2 = 149
-    var 3 = 237
-
-    print("hello from SCFB basic")
-    print(5 + 2)
-
-    draw type="box" {
-        width,height; 140,140
-        x,y; 300,220
-        rgb; var 1, var 2, var 3
-    }
-
-    create mybox {
-        def mybox type="box"
-    }
-
-    draw type="object" {
-        width,height,depth; 120,120,120
-        x,y; 580,220
-        rgb; var 1, var 2, var 3
-    }
-
-    create cube {
-        def cube type="object"
-    }
-
-    ref cube
-    rot type="object" {
-        X,Y,Z; 25, 40, 0
-    }
-
-    if var 1 == 100 {
-        print("variable 1 is 100")
-    fi
-
-    function greet() {
-        print("greetings from greet()")
-    fi
-
-    call greet()
-    print(mybox.width)
-    jump .end
-    print("this line is skipped")
-    .end
-    print("done")
+- One live SCREEN mixing `print` text and drawings (optional `x,y;` positions, `rot` updates in place); LOG pane separate
+- 2D boxes = pixel-exact squares/rectangles; 3D objects = proper shaded rotating cubes
+- Dark Windows 11 title bar (Mica attempt), Segoe UI Variable / Cascadia Code, per-monitor DPI
+- Editor with line numbers, Run (F5 / Ctrl+Enter), Stop, Open, Save, Example, Help
+- Full language: def, create, cvar/var, import <file.scb>, lib <>, ext <>, both print forms, ref,
+  if + fi, input + fi, function + call, jump, .checkpoints, draw/rot, operators, // comments
+- No step limit — jump loops animate until Stop; live step counter in the status bar
 
 (branches close with `fi` — no indentation rules.)
