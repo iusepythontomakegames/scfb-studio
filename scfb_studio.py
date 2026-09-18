@@ -1110,6 +1110,20 @@ print("this line is skipped")
 .end
 
 print("done")
+
+// ── input ─────────────────────────────────────────
+// the bar under the screen lights up while the program waits.
+// input WORD matches the typed line (quotes optional, case-insensitive)
+print("type yes when the bar lights up")
+input yes {
+    print("you typed yes!")
+fi
+
+// bare input stores whatever you type into the selected variable
+cvar 9
+var 9
+input
+print(var 9)
 '''
 
 REFERENCE = """
@@ -1750,15 +1764,19 @@ def selftest():
     def check(name, cond, detail=""):
         results.append((name, bool(cond), detail))
 
-    # 1 — the example program runs end-to-end
+    # 1 — the example program runs end-to-end (input bar is auto-fed)
     outs = []
+    inq1 = queue.Queue()
+    inq1.put("YES")
+    inq1.put("hello")
     rt = Runtime(EXAMPLE, out=lambda t, tone: outs.append((t, tone)),
-                 redraw=lambda: None, input_queue=queue.Queue())
+                 redraw=lambda: None, input_queue=inq1)
     status = rt.run()
     texts = [t for t, tone in outs if tone == "out"]
     check("example runs", status == "ok", "status=%s" % status)
     for want in ("hello from SCFB basic", "7", "variable 1 is 100",
-                 "greetings from greet()", "140", "done"):
+                 "greetings from greet()", "140", "done",
+                 "you typed yes!", "hello"):
         check("prints %r" % want, want in texts, str(texts))
     check("skipped line not printed", "this line is skipped" not in texts)
     check("2 objects drawn", len(rt.objects) == 2, str(len(rt.objects)))
